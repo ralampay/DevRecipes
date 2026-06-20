@@ -157,6 +157,28 @@ openssl rand -hex 64
 
 Use the exact same value for the backend and the local Lambda runtime. This is what lets the local callback exercise the same HMAC verification path used in production.
 
+### Allow HTTP for Local Callbacks
+
+Local callback testing often uses plain HTTP because the backend is running on a developer machine, such as `http://localhost:3000` or `http://host.docker.internal:3000`. Some frameworks and middleware reject or redirect non-HTTPS callback requests by default. For example, a Rails application with SSL enforcement enabled can redirect the local Lambda callback from HTTP to HTTPS, which prevents the worker from reaching the callback endpoint correctly.
+
+Allow HTTP callbacks only in the local or development environment, and keep the HMAC signature verification enabled. The local exception should be controlled by an explicit setting such as `ALLOW_INSECURE_LOCAL_CALLBACKS=true`, not by disabling callback security entirely. In production and shared deployed environments, callback URLs should remain HTTPS-only.
+
+For Rails-style applications, this usually means making SSL enforcement environment-aware. The exact code depends on the application, but the policy should be:
+
+```ruby
+# config/environments/development.rb
+config.force_ssl = false
+```
+
+If the application has custom callback validation, it should also allow the `http` scheme only when the development-only flag is enabled:
+
+```ruby
+allow_http_callback = Rails.env.development? && ENV["ALLOW_INSECURE_LOCAL_CALLBACKS"] == "true"
+callback_uri = URI.parse(callback_url)
+
+raise "Callback URL must use HTTPS" unless callback_uri.scheme == "https" || allow_http_callback
+```
+
 Run the backend on a host and port that the Lambda container can reach. For many frameworks, binding to all interfaces is necessary because the callback originates from a Docker container rather than from the host process itself:
 
 ```bash
