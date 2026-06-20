@@ -2,248 +2,212 @@
 
 ## Overview
 
-Some application tasks are too expensive, slow, or specialized to run inside the main web backend. File parsing, media processing, report generation, imports, and machine-learning jobs often need more memory, longer execution time, isolated dependencies, or elastic compute. The backend still needs to own user authentication, permissions, request state, and the final database record, but the heavy work can be delegated to a serverless worker.
+Modern web applications often need to perform work that does not fit cleanly inside a normal request-response cycle. Examples include parsing uploaded files, generating reports, processing media, importing large datasets, running document analysis, extracting metadata, or performing any task that requires more memory, more execution time, or more specialized dependencies than the main backend should carry. Running this work directly in the backend can make API requests slow, increase memory pressure, complicate deployments, and make failures harder to isolate.
 
-This pattern solves that problem by splitting the workflow into two directions:
+The general solution is to keep the backend responsible for user authentication, authorization, request validation, job state, and final persistence, while delegating the expensive work to a serverless function such as AWS Lambda. The backend creates a durable job record, stores or references the input data, invokes the function asynchronously, and immediately returns control to the client. The client can then poll the backend or subscribe to updates while the work continues independently.
 
-1. The backend invokes a Lambda function asynchronously with a small job payload.
-2. The Lambda function performs the work, writes large output to shared object storage, then calls the backend through a signed callback.
+This guide describes a secure invocation-and-callback pattern for asynchronous tasks. The backend sends a small job payload to Lambda, usually containing a job id and an object-storage key. Lambda performs the work, writes large output back to object storage, and sends a signed callback to the backend when the job succeeds or fails. The callback does not use a user session or bearer token because it is a machine-to-machine event. Instead, Lambda signs the exact JSON callback body with a shared secret using HMAC-SHA256, and the backend verifies that signature before accepting the status update.
 
-In the Envelop codebase, this pattern is used for IFC file parsing. Rails accepts an authenticated file upload, stores the raw file in S3 through Active Storage, invokes the IFC parser Lambda with the database record id and S3 object key, and moves the record to `processing`. The Lambda downloads the raw IFC file from S3, parses it, uploads parsed JSON to a parser-output S3 bucket, then calls Rails at:
-
-```http
-PUT /ifc_files/:id/serverless_update
-```
-
-The callback is not authenticated with a user bearer token because it is a machine-to-machine completion event. Instead, Lambda signs the exact JSON body with `LAMBDA_CALLBACK_SECRET` using HMAC-SHA256 and sends the signature in `X-Lambda-Signature`. Rails independently computes the expected signature over the raw request body and compares the values securely before updating the record.
+This pattern solves three common problems at once. First, it keeps long-running or resource-heavy work out of the web request path. Second, it avoids sending large files or generated output through API payloads by using object storage as the data plane. Third, it gives the backend a secure way to accept completion events from an external worker without exposing a callback endpoint that arbitrary callers can spoof.
 
 ## Architecture
 
-The architecture separates the control plane from the data plane.
+The architecture has two separate flows: a **control plane** and a **data plane**. Separating these concerns is the key design choice. The control plane carries small messages that describe what should happen and what happened. The data plane carries large input and output artifacts through object storage.
 
-Control plane:
+The **control plane** starts in the backend. A user or client submits a request to create a job, such as uploading a file or asking for a document to be processed. The backend authenticates the user, validates permissions, creates a database record, and stores the job in an initial state such as `pending`. The backend then invokes Lambda with a compact payload that contains the job id and any references Lambda needs to find the input data. In AWS, the backend can invoke Lambda asynchronously with an event-style invocation so the backend is not waiting for the job to complete.
 
-- The backend creates and owns the job record.
-- The backend invokes Lambda with a compact payload: the job id and source S3 object key.
-- Lambda calls the backend callback endpoint when the job reaches a terminal state.
-- The backend validates the callback signature and persists the final status.
+The **data plane** usually uses S3 or another durable object store. The backend writes the raw input to an input bucket or receives an existing object key from the client. Lambda reads that input object, performs the task, and writes generated output to an output bucket. Instead of returning a large result through the callback, Lambda returns only metadata such as an output object key, status, and message. The backend stores that output key on the job record and can read the output object later when the client requests it.
 
-Data plane:
-
-- The raw upload is stored in an S3 bucket that both Rails and Lambda can access.
-- Lambda writes generated output to a parser-output S3 bucket.
-- The backend stores only the output object key, then reads the parsed JSON from S3 when needed.
-
-The Envelop flow is:
+A typical production flow looks like this:
 
 ```text
-Browser
-  -> Rails API: POST /ifc_files
-  -> Rails Active Storage uploads raw IFC to S3
-  -> Rails invokes Lambda with { id, ifc_file_key }
-  -> Rails marks IfcFile as processing
-  -> Lambda downloads ifc_file_key from AWS_IFC_FILES_BUCKET
-  -> Lambda parses the IFC file
-  -> Lambda uploads parsed JSON to S3_BUCKET
-  -> Lambda signs callback body with LAMBDA_CALLBACK_SECRET
-  -> Lambda PUTs /ifc_files/:id/serverless_update
-  -> Rails verifies HTTPS and HMAC signature
-  -> Rails stores data_key and maps success to done or failed to failed
+Client
+  -> Backend API: create job or upload input
+  -> Backend stores input in object storage
+  -> Backend creates job record with status=pending
+  -> Backend invokes Lambda asynchronously with { job_id, input_key }
+  -> Backend marks job as processing
+  -> Lambda downloads input from object storage
+  -> Lambda performs the expensive task
+  -> Lambda uploads output to object storage
+  -> Lambda signs callback body with a shared secret
+  -> Lambda sends callback to Backend API
+  -> Backend verifies HTTPS and HMAC signature
+  -> Backend stores output_key and terminal status
 ```
 
-The main moving parts are:
+The callback endpoint should be treated as a dedicated machine endpoint. It should not depend on the end user's authentication token, because the user is no longer involved when Lambda completes the task. Instead, the endpoint should require a cryptographic signature. Lambda and the backend both know the same secret value. Lambda computes:
 
-- Rails `IfcFiles::Create`: creates the upload record and starts parsing in development or production.
-- Rails `IfcFiles::InvokeAwsLambdaIfcParser`: sends `{ id, ifc_file_key }` to Lambda. In AWS it uses asynchronous `InvocationType=Event`; locally it can POST to SAM using `IFC_PARSER_LOCAL_URL`.
-- Lambda handler: validates the parser request, downloads from S3, parses the file, uploads parsed JSON, and notifies Rails.
-- Lambda `NotifyBackend`: builds the callback URL, signs the raw JSON body, and sends the callback.
-- Rails `LambdaCallbacks::VerifySignature`: requires HTTPS, requires `LAMBDA_CALLBACK_SECRET`, computes `HMAC_SHA256(secret, raw_request_body)`, and uses secure comparison.
-- Rails `IfcFiles::ServerlessUpdate`: updates `data_key` and terminal status, while allowing idempotent retry callbacks.
+```text
+signature = HMAC_SHA256(SHARED_CALLBACK_SECRET, raw_json_body)
+```
 
-The shared secret is configured on both sides:
+Lambda sends that signature in a header such as:
 
-- Rails: `LAMBDA_CALLBACK_SECRET`
-- SAM/Lambda parameter: `LambdaCallbackSecret`
-- Lambda runtime variable: `LAMBDA_CALLBACK_SECRET`
+```http
+X-Lambda-Signature: <hex_hmac_sha256_signature>
+```
 
-The secret should be long, random, environment-specific, and never committed.
+The backend reads the raw request body exactly as received, computes the expected HMAC using the same secret, and compares the expected value with the provided signature using a constant-time comparison function. If the signature is missing, invalid, or computed over different bytes, the backend rejects the callback.
+
+The main components are:
+
+- **Backend job endpoint**: Authenticates the user, validates the request, creates the job record, stores or references input data, and starts the asynchronous worker.
+- **Object storage input bucket**: Holds raw input artifacts that are too large or inconvenient to pass directly through Lambda payloads.
+- **Lambda worker**: Downloads the input, performs the task, writes the output, and sends the completion callback.
+- **Object storage output bucket**: Holds generated output artifacts such as JSON, reports, thumbnails, transformed files, or extraction results.
+- **Backend callback endpoint**: Verifies the HMAC signature, validates the payload, updates job state, and stores the output reference.
+- **Shared callback secret**: A long random value available to both Lambda and the backend through secure environment configuration or a secrets manager.
 
 ## Methodology
 
-1. Create the job record before invoking Lambda.
+Start by designing the backend as the source of truth for the job lifecycle. The backend should create a durable job record before invoking Lambda. This record gives the system a stable identifier for logs, retries, status polling, callbacks, and user-visible history. Common statuses are `pending`, `processing`, `succeeded`, and `failed`, though the exact names should match the domain. The important rule is that a job should exist before external work begins, so the callback has something authoritative to update.
 
-   The backend should persist a durable record before starting external work. This creates a stable id for retries, polling, logs, and callbacks. In Envelop, new IFC records start as `pending`, then move to `processing` after the parser is invoked.
+Keep the Lambda invocation payload small and reference-based. A good payload usually contains a job id, an input object key, and perhaps a few simple options. It should not contain the uploaded file itself or the full output destination payload. For example:
 
-2. Pass only a small invocation payload.
+```json
+{
+  "job_id": "9b6f5a8e-3f4a-4c2e-9a1f-2c7a1c5a2c10",
+  "input_key": "uploads/2026/06/20/source-file.bin",
+  "options": {
+    "mode": "standard"
+  }
+}
+```
 
-   Lambda receives the database record id and source object key:
+Use object storage as the handoff mechanism for large data. The backend and Lambda need a shared understanding of where inputs and outputs live. In AWS, this usually means one bucket or prefix for inputs and another bucket or prefix for generated outputs. Lambda should have IAM permissions only for the object paths it needs. The backend should store output keys, not large generated payloads, in its database. This keeps database rows small and allows large artifacts to be fetched, streamed, cached, lifecycle-managed, or deleted independently.
 
-   ```json
-   {
-     "id": "ifc-file-id",
-     "ifc_file_key": "active-storage-s3-object-key"
-   }
-   ```
+Invoke Lambda asynchronously when the backend does not need the result immediately. With AWS Lambda, this means using an event invocation rather than a request-response invocation. The backend should treat successful invocation as "the job was accepted for processing," not "the job succeeded." After invocation, the backend updates the job status to `processing` and returns a response to the client. The client can poll a status endpoint, refresh a job list, or receive updates through websockets or notifications.
 
-   Large files and large parser outputs do not move through Lambda invocation or callback bodies. They move through S3.
+Make Lambda responsible for reporting both success and failure. On success, Lambda should upload the generated output and call the backend with a payload that includes a success status and the output key. On failure, Lambda should still call the backend with a failed status and a useful message, as long as it has enough context to identify the job. This prevents jobs from staying stuck in `processing` when parsing, transformation, or output upload fails.
 
-3. Use S3 as the shared data plane.
+Use a signed callback instead of trusting the callback endpoint by obscurity. A callback URL is not secret enough to protect state changes. Anyone who discovers the URL could attempt to mark arbitrary jobs as complete unless the backend verifies that the request came from a trusted worker. HMAC signing is a simple and reliable mechanism for this. The worker signs the exact body it sends, and the backend verifies that exact body before parsing or applying the update.
 
-   The backend writes the raw upload to an S3 bucket. Lambda reads that bucket through `AWS_IFC_FILES_BUCKET`. Lambda writes parsed output to `S3_BUCKET`. The backend reads parsed output later through its matching `AWS_IFC_FILES_DATA_BUCKET`.
+A success callback body can be shaped like this:
 
-   This avoids request timeouts, large HTTP bodies, and duplicated file transport logic.
+```json
+{
+  "status": "success",
+  "output_key": "outputs/9b6f5a8e-3f4a-4c2e-9a1f-2c7a1c5a2c10.json",
+  "message": "Task completed successfully"
+}
+```
 
-4. Invoke Lambda asynchronously in deployed environments.
+A failure callback body can be shaped like this:
 
-   Rails invokes the Lambda function by name using `InvocationType=Event`. That lets the API return quickly while the job continues out of process. The backend state communicates progress to the frontend through statuses such as `pending`, `processing`, `done`, and `failed`.
+```json
+{
+  "status": "failed",
+  "output_key": null,
+  "message": "Input file could not be parsed"
+}
+```
 
-5. Sign the callback with HMAC-SHA256.
+The signature must be computed over the raw JSON string exactly as it is sent on the wire. This detail matters. If Lambda signs a compact JSON string but the backend verifies a pretty-printed or reserialized object, the signature will not match. The backend should read the raw request body, compute the HMAC, compare the signature, and only then trust the parsed payload enough to update state.
 
-   Lambda serializes the callback JSON, signs that exact string, and sends both body and signature:
+Require HTTPS for deployed callbacks. HMAC proves that the body was signed by a party that knows the secret, but HTTPS still protects the request in transit and prevents intermediaries from observing callback payloads or replaying useful metadata. For local development, it is reasonable to allow HTTP callbacks behind an explicit development-only flag, but that exception should still require a valid signature and should never be enabled in production.
 
-   ```text
-   signature = HMAC_SHA256(LAMBDA_CALLBACK_SECRET, raw_json_body)
-   ```
+Make callback updates idempotent. Serverless systems and HTTP callbacks can retry after timeouts, partial failures, or ambiguous network errors. If Lambda sends the same success callback twice, the backend should not fail the second request or corrupt the job. A practical rule is to accept repeated terminal updates when the existing status and output key match the incoming values. If the incoming callback conflicts with an existing terminal state, the backend should reject it or log it for investigation.
 
-   Example success payload:
-
-   ```json
-   {
-     "data_key": "generated-parser-json-key",
-     "status": "success",
-     "message": "IFC file parsed successfully"
-   }
-   ```
-
-   Example failure payload:
-
-   ```json
-   {
-     "data_key": null,
-     "status": "failed",
-     "message": "error details"
-   }
-   ```
-
-6. Verify the raw body, not a parsed or reformatted body.
-
-   The backend must compute the expected HMAC over the exact raw request body bytes. If it parses and reserializes JSON before verification, harmless formatting changes can break signatures and malicious transformations can become harder to reason about.
-
-7. Require HTTPS for deployed callbacks.
-
-   Rails accepts callbacks only over HTTPS or when `X-Forwarded-Proto` says `https`. Envelop has a development-only escape hatch, `ALLOW_INSECURE_LAMBBDA_CALLBACKS=true`, so local SAM can call local Rails over HTTP while still requiring a valid HMAC signature.
-
-8. Make callbacks idempotent.
-
-   Serverless callbacks can be retried after network failures or ambiguous responses. The backend should safely accept a repeated terminal update when the status and output key match the existing record. Envelop does this for repeated `done` or `failed` updates with the same `data_key`.
-
-9. Keep authorization boundaries clear.
-
-   User-facing endpoints still require normal authentication and ownership checks. The callback endpoint intentionally skips user bearer authentication because Lambda is not acting as a user. Its authority comes from possession of the shared secret and a valid HMAC signature.
+Protect secrets as deployment configuration, not source code. The shared callback secret should be generated with a cryptographically strong random generator, stored in a secrets manager or secure environment configuration, and injected into both the backend and Lambda at runtime. Use a different secret per environment. Rotate the secret if it is exposed. Do not log it, commit it, or include it in client-side configuration.
 
 ## Local Testing Setup
 
-Local testing keeps Rails and SAM on the developer machine while S3 remains in AWS:
+A local setup should preserve the same architecture while replacing the deployed Lambda with a local serverless runtime. With AWS SAM, the backend can run on the developer machine, the Lambda function can run inside a local container, and object storage can remain in AWS. This allows developers to test the complete flow without deploying every code change.
+
+The local flow looks like this:
 
 ```text
-Local browser or curl
-  -> local Rails API
-  -> local SAM Lambda container
-  -> AWS S3
-  -> local Rails callback
+Local client or curl
+  -> Local backend API
+  -> Local SAM Lambda container
+  -> Object storage
+  -> Local backend callback endpoint
 ```
 
-Backend environment:
+The backend needs environment variables for object storage, Lambda invocation, local serverless routing, and callback verification. Generic names might look like this:
 
 ```env
-RAILS_ENV=development
-AWS_REGION=ap-southeast-1
-AWS_BUCKET=<active-storage-ifc-upload-bucket>
-AWS_IFC_FILES_DATA_BUCKET=<parser-output-bucket>
-AWS_LAMBDA_IFC_PARSER_NAME=<deployed-lambda-function-name>
-IFC_PARSER_LOCAL_URL=http://127.0.0.1:8080/parse-ifc
-ALLOW_INSECURE_LAMBBDA_CALLBACKS=true
+APP_ENV=development
+CLOUD_REGION=ap-southeast-1
+INPUT_STORAGE_BUCKET=<input-artifact-bucket>
+OUTPUT_STORAGE_BUCKET=<output-artifact-bucket>
+ASYNC_WORKER_FUNCTION_NAME=<deployed-worker-function-name>
+LOCAL_WORKER_URL=http://127.0.0.1:8080/process
+ALLOW_INSECURE_LOCAL_CALLBACKS=true
 LAMBDA_CALLBACK_SECRET=<shared-callback-secret>
 ```
 
-Serverless environment:
+The local Lambda or SAM environment needs matching storage and callback settings:
 
 ```env
-AWS_REGION=ap-southeast-1
-AWS_IFC_FILES_BUCKET=<active-storage-ifc-upload-bucket>
-S3_BUCKET=<parser-output-bucket>
-ENVELOP_API_BASE_URL=http://localhost:3000
+CLOUD_REGION=ap-southeast-1
+INPUT_STORAGE_BUCKET=<input-artifact-bucket>
+OUTPUT_STORAGE_BUCKET=<output-artifact-bucket>
+BACKEND_API_BASE_URL=http://localhost:3000
 LOCAL_BACKEND_HOST=host.docker.internal
 LAMBDA_CALLBACK_SECRET=<shared-callback-secret>
 ```
 
-Generate the shared secret:
+Generate a strong shared secret for development:
 
 ```bash
 openssl rand -hex 64
 ```
 
-Use the exact same value in Rails and Lambda/SAM.
+Use the exact same value for the backend and the local Lambda runtime. This is what lets the local callback exercise the same HMAC verification path used in production.
 
-Run Rails so the SAM container can reach it:
+Run the backend on a host and port that the Lambda container can reach. For many frameworks, binding to all interfaces is necessary because the callback originates from a Docker container rather than from the host process itself:
 
 ```bash
-cd envelop-api
-bundle install
-bundle exec rails db:create db:migrate
-bundle exec rails server -b 0.0.0.0 -p 3000
+backend-server --host 0.0.0.0 --port 3000
 ```
 
-Run SAM locally:
+Run the local serverless API with SAM or an equivalent tool:
 
 ```bash
-cd envelop-serverless
 sam build
 sam local start-api -p 8080
 ```
 
-With `IFC_PARSER_LOCAL_URL=http://127.0.0.1:8080/parse-ifc`, Rails posts parser jobs to the local SAM API instead of invoking the deployed Lambda function. The Lambda container cannot call `localhost:3000` to reach Rails because `localhost` points to the container itself. The serverless code rewrites local callback URLs to `LOCAL_BACKEND_HOST`, usually `host.docker.internal`, so the callback reaches Rails at `http://host.docker.internal:3000`.
+When the backend is configured with `LOCAL_WORKER_URL=http://127.0.0.1:8080/process`, it should call the local serverless endpoint instead of invoking the deployed Lambda function. This makes the full application flow testable: create a job through the backend, let the local Lambda process it, write output to object storage, and send a signed callback back to the local backend.
 
-For manual invocation of the local parser:
+One local networking issue is worth calling out. Inside a Docker container, `localhost` usually refers to the container itself, not the developer machine. If Lambda needs to call the backend at `http://localhost:3000`, the local runtime may need to rewrite the callback host to `host.docker.internal` or another host gateway address. A common local callback URL from the container is:
+
+```text
+http://host.docker.internal:3000/jobs/{job_id}/callback
+```
+
+For manual testing, call the local serverless endpoint with a job id and input key that already exist:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/parse-ifc \
+curl -X POST http://127.0.0.1:8080/process \
   -H "Content-Type: application/json" \
   -d '{
-    "id": "ifc-file-id",
-    "ifc_file_key": "active-storage-blob-key"
+    "job_id": "9b6f5a8e-3f4a-4c2e-9a1f-2c7a1c5a2c10",
+    "input_key": "uploads/example-input.bin"
   }'
 ```
 
-Expected result:
+The expected local result is the same as production. The worker receives the job request, downloads the input artifact, performs the task, uploads the output artifact, signs the callback, and sends the callback to the backend. The backend verifies the signature, updates the job status, and stores the output key.
 
-1. SAM receives the parser request.
-2. Lambda downloads the raw file from `AWS_IFC_FILES_BUCKET`.
-3. Lambda writes parsed JSON to `S3_BUCKET`.
-4. Lambda calls Rails at `/ifc_files/:id/serverless_update`.
-5. Rails verifies the HMAC signature.
-6. Rails stores `data_key` and updates the status to `done`, or stores `failed` on parser failure.
+If local testing fails, check the basics in this order:
 
-Troubleshooting checks:
-
-- `AWS_BUCKET` in Rails must match `AWS_IFC_FILES_BUCKET` in Lambda.
-- `AWS_IFC_FILES_DATA_BUCKET` in Rails must match `S3_BUCKET` in Lambda.
-- `LAMBDA_CALLBACK_SECRET` must be identical on both sides.
-- Local Rails must be reachable from Docker, usually through `host.docker.internal`.
-- Local HTTP callbacks require `ALLOW_INSECURE_LAMBBDA_CALLBACKS=true` in Rails development.
-- Deployed callbacks should use an HTTPS `ENVELOP_API_BASE_URL`.
+- The backend and Lambda use the same `LAMBDA_CALLBACK_SECRET`.
+- The backend input bucket configuration matches the worker input bucket configuration.
+- The backend output bucket configuration matches the worker output bucket configuration.
+- The input object key exists and the worker has permission to read it.
+- The worker has permission to write the output object.
+- The callback base URL is reachable from inside the Lambda container.
+- Local HTTP callbacks are explicitly allowed only in development.
+- Production callback URLs use HTTPS.
 
 ## Solution Summary
 
-This solution provides a secure, practical pattern for asynchronous serverless work:
+This pattern provides a reusable way to run asynchronous serverless work without weakening the backend's authority over application state. The backend remains the system of record. It authenticates users, creates jobs, controls permissions, and stores final status. Lambda remains a focused worker. It handles the resource-heavy task, writes output to object storage, and reports completion.
 
-- The backend owns authentication, authorization, job records, and final state.
-- Lambda owns expensive or specialized processing.
-- S3 carries large input and output data between systems.
-- The Lambda invocation payload stays small and durable.
-- The completion callback is protected with an HMAC-SHA256 signature over the exact raw JSON body.
-- HTTPS is required outside local development.
-- The backend stores an output key instead of large generated data.
-- Idempotent callbacks make retries safe.
+The most important design choice is to avoid moving large artifacts through control messages. Invocation payloads and callback bodies should stay small. Files, generated JSON, reports, images, or other large outputs should move through object storage. The database should store durable references to those artifacts, such as object keys, rather than the artifacts themselves.
 
-The result is a clean division of responsibility. The web API remains responsive and authoritative, Lambda can scale and use isolated dependencies for heavy work, and the callback can be exposed without user credentials because it is authenticated cryptographically through a shared secret.
+The most important security choice is to sign callbacks with a shared secret. A callback endpoint often cannot use normal user authentication because it is called by infrastructure, not by a user. HMAC-SHA256 over the exact raw request body gives the backend a concrete way to verify that the callback was produced by a trusted worker and that the body was not changed after signing.
+
+The production-ready version of this solution should include HTTPS-only callbacks, constant-time signature comparison, environment-specific secrets, least-privilege storage permissions, idempotent callback handling, clear job states, and logs that include job ids but never secrets. With those pieces in place, the backend can safely delegate heavy work to Lambda while still keeping control over data, status, and user-visible results.
