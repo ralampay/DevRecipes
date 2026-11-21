@@ -15,13 +15,13 @@ This setup solves a common deployment problem:
 5. Creates environment variables from GitHub Secrets
 6. Installs dependencies
 7. Builds the frontend
-8. Uploads the built files to S3
-9. Applies proper cache rules for frontend assets and `index.html`
+8. Re-uploads every built file to S3 with caching disabled, uploading `index.html` after assets
+9. Removes stale files from the site bucket
 
 ## Required GitHub Secrets
 
 ```text
-AWS_ACCESS_KEY
+AWS_ACCESS_KEY_ID
 AWS_SECRET_KEY
 AWS_REGION
 S3_BUCKET_NAME
@@ -52,18 +52,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
-          node-version: 24.13.0
+          node-version: 26.13.1
           cache: npm
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v6
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
@@ -79,40 +79,49 @@ jobs:
 
       - name: Deploy (no cache)
         run: |
-          aws s3 sync ./public s3://${{ secrets.S3_BUCKET_NAME }} \
+          test -f ./public/index.html
+
+          aws s3 cp ./public "s3://${{ secrets.S3_BUCKET_NAME }}/" \
+            --recursive \
             --exclude "index.html" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+          aws s3 cp ./public/index.html "s3://${{ secrets.S3_BUCKET_NAME }}/index.html" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+          aws s3 sync ./public "s3://${{ secrets.S3_BUCKET_NAME }}/" \
             --delete \
-            --cache-control "max-age=31536000, immutable"
-
-          aws s3 cp ./public/index.html s3://${{ secrets.S3_BUCKET_NAME }}/index.html \
-            --cache-control "no-cache, no-store, must-revalidate" \
-            --metadata-directive REPLACE
+            --cache-control "no-cache, no-store, must-revalidate"
 ```
 
-## Why Cache Static Assets Differently?
+## How Fresh Deployments Work
 
-Static assets such as:
+This recipe serves the site directly from S3 and prioritizes freshness over bandwidth savings. Every file, including JavaScript, CSS, images, fonts, and HTML, is uploaded with:
 
-- JavaScript bundles
-- CSS files
-- Images
-- Fonts
+```text
+Cache-Control: no-cache, no-store, must-revalidate
+```
 
-can be cached for a long time:
+The recursive `aws s3 cp` uploads every asset on each deployment, even if its contents have not changed. This also replaces old cache headers. Using `s3 sync` alone is insufficient for that purpose because unchanged files can be skipped and retain their previous metadata. See the [AWS CLI sync reference](https://docs.aws.amazon.com/cli/latest/reference/s3/sync.html).
+
+The workflow checks that `public/index.html` exists before uploading, uploads assets first, and then uploads `index.html`. A final `s3 sync --delete` removes remote files that are absent from the build output. Use a bucket dedicated to this site: this cleanup deletes any other files in that bucket. The cleanup uses the same cache headers in case it uploads any files.
+
+These headers prevent future responses from being stored by compliant browser caches. They cannot revoke files already cached under the previous one-year `immutable` policy. For those existing cached files, use new asset URLs (such as content-hashed filenames) or clear the browser cache once. An already open page must reload to load the new application. This is not an atomic deployment; deleting old assets can also affect tabs still running an earlier version.
+
+## Verify Cache Headers
+
+After deploying, inspect `index.html` and a representative asset, replacing the bucket and asset key below:
 
 ```bash
---cache-control "max-age=31536000, immutable"
+aws s3api head-object --bucket your-bucket-name --key index.html \
+  --query CacheControl --output text
+aws s3api head-object --bucket your-bucket-name --key assets/app.js \
+  --query CacheControl --output text
 ```
 
-This improves performance and reduces bandwidth usage.
+Both should return `no-cache, no-store, must-revalidate`. Deploy the same build again and confirm that the `cp` commands upload unchanged files and the headers remain correct.
 
-However, `index.html` should never be cached aggressively because it references the latest asset versions. It is uploaded separately with:
-
-```bash
---cache-control "no-cache, no-store, must-revalidate"
-```
-
-This ensures users always receive the latest application version after deployment.
+In your browser's Network panel, reload the site and inspect the response headers for the document and an asset. Confirm that both have the expected `Cache-Control` value. If migrating from the previous cache policy, clear the old browser cache first; then reload again with the browser's normal caching enabled to verify the new behavior.
 
 ## Recommended IAM Permissions
 
@@ -141,11 +150,13 @@ This ensures users always receive the latest application version after deploymen
 
 ### Deployment succeeds but site does not update
 
-Usually caused by browser or CDN caching. Ensure `index.html` is uploaded with:
+Check the response headers for both `index.html` and the affected assets. All should include:
 
 ```text
 no-cache, no-store, must-revalidate
 ```
+
+If an asset still comes from an old browser cache, changing its S3 headers does not invalidate that saved response. Change its URL or clear the browser cache once, then follow the verification steps above. If the app uses a service worker, its cache must also be updated by the app; S3 upload headers do not clear service-worker caches.
 
 ### Build succeeds but files are missing
 
@@ -167,4 +178,4 @@ Confirm:
 
 ## Summary
 
-This GitHub Actions workflow creates a simple CI/CD pipeline for static frontend applications hosted on Amazon S3. Every push to `master` automatically builds and deploys the application while applying optimal cache-control headers for both assets and HTML files.
+This GitHub Actions workflow creates a simple CI/CD pipeline for static frontend applications hosted on Amazon S3. Every push to `master` automatically builds and deploys the application by re-uploading all build files with caching disabled and removing stale files. Previously cached browser responses require new URLs or a one-time cache clear.
