@@ -168,6 +168,8 @@ Issued
 
 ## Step 4: Create a CloudFront Distribution
 
+Open **CloudFront → Distributions → Create distribution**. The console uses a multi-step wizard; configure the S3 origin and cache settings before proceeding with **Next**.
+
 Origin:
 
 ```text
@@ -198,7 +200,33 @@ This allows CloudFront to securely access a private bucket.
 
 ## Step 6: Configure CloudFront
 
-Set:
+### Cache settings
+
+In the creation wizard's **Cache settings** section, choose **Customize cache settings** instead of **Use recommended cache settings tailored to serving S3 content**. This exposes the controls shown below.
+
+For this static S3 website, use:
+
+| Console field | Selection |
+| --- | --- |
+| Viewer protocol policy | **Redirect HTTP to HTTPS** |
+| Allowed HTTP methods | **GET, HEAD** |
+| Cache policy | **CachingOptimized** (shown as **Recommended for S3**) |
+| Origin request policy - optional | Leave unselected (**Select origin policy**) |
+| Response headers policy - optional | Leave unselected (**Select response headers**) |
+
+**Redirect HTTP to HTTPS** upgrades HTTP requests to HTTPS. **HTTPS only** rejects HTTP requests instead. See the [AWS viewer HTTPS documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-https-viewers-to-cloudfront.html).
+
+**CachingOptimized** enables caching and supports Gzip and Brotli compression. Choose the existing policy from the dropdown; you do not need to click **Create cache policy**. See [AWS managed cache policies](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html).
+
+The optional origin request and response headers policies can remain unselected for this basic static website setup. Sites that require CORS or specific response headers need additional configuration.
+
+Click **Next** to continue the wizard.
+
+### Domain, certificate, and default root object
+
+Complete the domain and certificate configuration below as those settings appear in the wizard. Set the default root object in the distribution settings if it is not offered during creation.
+
+Set the default root object:
 
 ```text
 Default Root Object: index.html
