@@ -27,7 +27,6 @@ AWS_REGION
 S3_BUCKET_NAME
 API_BASE_URL
 TOKEN_BEARER
-CURRENT_USER
 ```
 
 ## Workflow File
@@ -72,7 +71,6 @@ jobs:
           cd ${GITHUB_WORKSPACE}
           echo "API_BASE_URL=${{ secrets.API_BASE_URL }}" >> .env
           echo "TOKEN_BEARER=${{ secrets.TOKEN_BEARER }}" >> .env
-          echo "CURRENT_USER=${{ secrets.CURRENT_USER }}" >> .env
           npm install
           npm run update_version
           npm run build
