@@ -226,11 +226,23 @@ Click **Next** to continue the wizard.
 
 Complete the domain and certificate configuration below as those settings appear in the wizard. Set the default root object in the distribution settings if it is not offered during creation.
 
-Set the default root object:
+To set the default root object on an existing distribution:
+
+1. Open **CloudFront → Distributions** and click your distribution's ID.
+2. Select the **General** tab.
+3. Find the panel titled **Settings**, then click **Edit** in that panel's upper-right corner.
+4. In **Default root object**, enter `index.html` without a leading `/`.
+5. Click **Save changes** and wait for the distribution to finish deploying.
+
+If you are on the **Edit origin** screen, save any intended origin changes or click **Cancel** if you have made none. Click the distribution ID in the breadcrumb at the top (**CloudFront → Distributions → your distribution ID → Edit origin**) to return to the distribution details, then follow the steps above starting with the **General** tab.
+
+The **Default root object** field belongs to the distribution's general settings, not its origin settings. Leave **Origin path** blank when `index.html` is stored at the root of your S3 bucket; do not enter `index.html` there.
 
 ```text
 Default Root Object: index.html
 ```
+
+This tells CloudFront to serve `index.html` when a visitor requests your site's root URL, such as `https://cloudbandsolutions.com/`. Make sure the file is uploaded to the root of the S3 bucket. See [AWS's default root object instructions](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/DefaultRootObject.html).
 
 Attach:
 
